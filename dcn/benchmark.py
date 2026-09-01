@@ -119,7 +119,7 @@ def timed_batches(
     multihost_utils.sync_global_devices(f"{label}_warmup_start")
     for _ in range(warmups):
         res = compiled_fn(x)
-    jax.block_until_ready(res)
+        jax.block_until_ready(res)
     multihost_utils.sync_global_devices(f"{label}_warmup_done")
 
     # 3. Timed Repetitions (Sync barrier MOVED OUTSIDE timer window)
