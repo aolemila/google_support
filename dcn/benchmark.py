@@ -108,37 +108,56 @@ def timed_batches(
     batch: int,
     reps: int,
     warmups: int,
+    profiling_dir: Path | None = None,
 ) -> list[float]:
-    """Return barrier-delimited per-iteration milliseconds."""
+    """Return barrier-delimited per-iteration milliseconds with AOT & isolated timing."""
 
+    # 1. AOT Compile
+    compiled_fn = fn.lower(x).compile()
+
+    # 2. Strict Warmup
     multihost_utils.sync_global_devices(f"{label}_warmup_start")
     for _ in range(warmups):
-        result = fn(x)
-    jax.block_until_ready(result)
+        res = compiled_fn(x)
+        jax.block_until_ready(res)
     multihost_utils.sync_global_devices(f"{label}_warmup_done")
 
+    # 3. Timed Repetitions (Sync barrier MOVED OUTSIDE timer window)
     per_iteration_ms: list[float] = []
     for rep in range(reps):
         multihost_utils.sync_global_devices(f"{label}_rep_{rep}_start")
         started = time.perf_counter()
-        for _ in range(batch):
-            result = fn(x)
+        result = compiled_fn(x)
         jax.block_until_ready(result)
-        # Required for the one-way case: the sender can complete before the
-        # receiver has consumed the payload.
-        multihost_utils.sync_global_devices(f"{label}_rep_{rep}_end")
         finished = time.perf_counter()
+        multihost_utils.sync_global_devices(f"{label}_rep_{rep}_end")
         per_iteration_ms.append((finished - started) * 1e3 / batch)
+
+    # 4. Hardware XProf Trace Capture
+    if profiling_dir is not None:
+        trace_path = profiling_dir / label
+        trace_path.mkdir(parents=True, exist_ok=True)
+        multihost_utils.sync_global_devices(f"{label}_trace_start")
+        jax.profiler.start_trace(str(trace_path))
+        trace_res = compiled_fn(x)
+        jax.block_until_ready(trace_res)
+        jax.profiler.stop_trace()
+        multihost_utils.sync_global_devices(f"{label}_trace_end")
+
     return per_iteration_ms
 
 
-def make_ppermute(mesh: Mesh, perm: list[tuple[int, int]]):
+def make_ppermute(mesh: Mesh, perm: list[tuple[int, int]], batch: int = 1):
     spec = P("dcn", None)
 
     @jax.jit
     def operation(x):
         def body(value):
-            return jax.lax.ppermute(value, "dcn", perm=perm)
+            if batch <= 1:
+                return jax.lax.ppermute(value, "dcn", perm=perm)
+            def step(i, val):
+                return jax.lax.ppermute(val, "dcn", perm=perm)
+            return jax.lax.fori_loop(0, batch, step, value)
 
         return smap(body, mesh, spec, spec)(x)
 
@@ -156,13 +175,17 @@ def make_all_gather(mesh: Mesh):
     return operation
 
 
-def make_all_reduce(mesh: Mesh):
+def make_all_reduce(mesh: Mesh, batch: int = 1):
     spec = P("dcn", None)
 
     @jax.jit
     def operation(x):
         def body(value):
-            return jax.lax.psum(value, "dcn")
+            if batch <= 1:
+                return jax.lax.psum(value, "dcn")
+            def step(i, val):
+                return jax.lax.psum(val, "dcn")
+            return jax.lax.fori_loop(0, batch, step, value)
 
         return smap(body, mesh, spec, spec)(x)
 
@@ -356,10 +379,10 @@ def main() -> None:
             x = make_input(mesh, dim)
             shard_bytes = dim * dim * itemsize / args.expected_num_slices
             factories = {
-                "ppermute_uni": lambda: make_ppermute(mesh, [(0, 1)]),
-                "ppermute_bidi": lambda: make_ppermute(mesh, [(0, 1), (1, 0)]),
+                "ppermute_uni": lambda: make_ppermute(mesh, [(0, 1)], batch=args.batch),
+                "ppermute_bidi": lambda: make_ppermute(mesh, [(0, 1), (1, 0)], batch=args.batch),
                 "all_gather": lambda: make_all_gather(mesh),
-                "all_reduce": lambda: make_all_reduce(mesh),
+                "all_reduce": lambda: make_all_reduce(mesh, batch=args.batch),
             }
             for variant in variants:
                 label = f"google_{variant}_p{participant_count}_d{dim}"
@@ -371,6 +394,7 @@ def main() -> None:
                     batch=args.batch,
                     reps=args.sample_runs,
                     warmups=args.warmup_runs,
+                    profiling_dir=profiling_dir,
                 )
                 after = network_snapshot()
                 median_ms = statistics.median(samples_ms)
