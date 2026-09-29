@@ -7,6 +7,7 @@ run_id="${VIT_REPRO_RUN_ID:-vit-while-layernorm-$(date -u +%Y%m%dT%H%M%SZ)}"
 state_dir="${VIT_REPRO_STATE_DIR:-$repo_root/vit_while_repro/results/$run_id}"
 timeout_seconds="${VIT_REPRO_TIMEOUT_SECONDS:-3600}"
 xla_flags="${VIT_REPRO_XLA_FLAGS---xla_backend_extra_options=xla_disable_while_loop_copies=true}"
+libtpu_version="${VIT_REPRO_LIBTPU_VERSION:-0.0.48.dev20260910+nightly}"
 mkdir -p "$state_dir"
 
 for command in falcon jq tar sed; do
@@ -16,6 +17,7 @@ done
 sed -e "s/__NAME__/${run_id}/g" \
   -e "s/__CLUSTER__/${cluster}/g" \
   -e "s|__XLA_FLAGS__|${xla_flags}|g" \
+  -e "s|__LIBTPU_VERSION__|${libtpu_version}|g" \
   "$repo_root/vit_while_repro/falcon/holder.yaml" > "$state_dir/holder.yaml"
 
 response="$(falcon workflow profile submit -f "$state_dir/holder.yaml" --output json)"

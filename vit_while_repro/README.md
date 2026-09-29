@@ -30,6 +30,14 @@ Run on one v7x `2x2x1` slice:
 ./vit_while_repro/falcon/run.sh
 ```
 
+Override the pinned libtpu build while keeping JAX/JAXLIB at 0.11.0:
+
+```bash
+VIT_REPRO_LIBTPU_VERSION=0.0.50.dev20260928+nightly \
+VIT_REPRO_RUN_ID=vit-while-layernorm-nightly-20260928 \
+./vit_while_repro/falcon/run.sh
+```
+
 For a same-version control with the option omitted:
 
 ```bash

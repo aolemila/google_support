@@ -15,7 +15,7 @@ role_to_task_spec:
     supply_mode: reservation
     envs:
       REPRO_JAX_VERSION: "0.11.0"
-      REPRO_LIBTPU_VERSION: "0.0.48.dev20260910+nightly"
+      REPRO_LIBTPU_VERSION: "__LIBTPU_VERSION__"
       XLA_FLAGS: "__XLA_FLAGS__"
     command: |
       set -eu
