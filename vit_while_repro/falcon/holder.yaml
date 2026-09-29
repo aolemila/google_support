@@ -1,0 +1,87 @@
+name: __NAME__
+exp_type: PROFILING
+artifact_type: operator-profile
+cluster_name: __CLUSTER__
+profile: true
+tags: [profile, compiler-repro, vit, while, layernorm]
+model_version: minimal-vit-while-layernorm
+role_to_task_spec:
+  worker:
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_type: v7x
+    device_count: 8
+    device_topo: 2x2x1
+    replica: 1
+    supply_mode: reservation
+    envs:
+      REPRO_JAX_VERSION: "0.11.0"
+      REPRO_LIBTPU_VERSION: "__LIBTPU_VERSION__"
+      XLA_FLAGS: "__XLA_FLAGS__"
+    command: |
+      set -eu
+      ulimit -c 0
+      mkdir -p /tmp/tpu_logs/tmp /tmp/tpu_logs/pip-cache /tmp/tpu_logs/uv-cache
+      export TMPDIR=/tmp/tpu_logs/tmp
+      export PIP_CACHE_DIR=/tmp/tpu_logs/pip-cache
+      export UV_CACHE_DIR=/tmp/tpu_logs/uv-cache
+
+      python3 -m venv --clear /tmp/vit-while-repro-venv
+      /tmp/vit-while-repro-venv/bin/pip install -q --upgrade pip
+      /tmp/vit-while-repro-venv/bin/pip install -q \
+        "jax[tpu]==${REPRO_JAX_VERSION}" \
+        -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+      /tmp/vit-while-repro-venv/bin/pip install -q --upgrade --no-deps \
+        "libtpu==${REPRO_LIBTPU_VERSION}" \
+        -f https://storage.googleapis.com/libtpu-wheels/index.html
+
+      /tmp/vit-while-repro-venv/bin/python - <<'PY'
+      import importlib.metadata as md
+      import os
+      actual = {name: md.version(name) for name in ("jax", "jaxlib", "libtpu")}
+      expected = {
+          "jax": os.environ["REPRO_JAX_VERSION"],
+          "jaxlib": os.environ["REPRO_JAX_VERSION"],
+          "libtpu": os.environ["REPRO_LIBTPU_VERSION"],
+      }
+      print("VIT_WHILE_REPRO_VERSION_CHECK", actual, flush=True)
+      if actual != expected:
+          raise RuntimeError(f"version mismatch: expected={expected}, actual={actual}")
+      PY
+
+      root="${ARTIFACT_LOCAL_DIR:?ARTIFACT_LOCAL_DIR must be set}"
+      mkdir -p "$root/profiling" "$root/rank-0/benchmark"
+      env | sort > "$root/profiling/env.txt"
+      /tmp/vit-while-repro-venv/bin/pip freeze > "$root/profiling/python-packages.txt"
+      cat > "$root/manifest.json" <<'JSON'
+      {
+        "schema_version": 1,
+        "workflow": "operator-optimization",
+        "operator_family": "normalization",
+        "operator_name": "vit_while_preattn_layernorm_backward",
+        "dimensions": {
+          "batch": 2,
+          "image_size": 224,
+          "patch_size": 14,
+          "tokens": 256,
+          "hidden": 1152,
+          "layers": 2,
+          "dtype": "bfloat16"
+        }
+      }
+      JSON
+
+      rm -f /tmp/vit-repro-ready /tmp/vit-repro-done /tmp/vit-repro-status
+      touch /tmp/vit-repro-ready
+      echo VIT_WHILE_REPRO_HOLDER_READY
+      while [ ! -f /tmp/vit-repro-done ]; do sleep 5; done
+      if [ -f /tmp/vit-repro.log ]; then
+        cp /tmp/vit-repro.log "$root/rank-0/benchmark/repro.log"
+        echo VIT_WHILE_REPRO_LOG_BEGIN
+        cat /tmp/vit-repro.log
+        echo VIT_WHILE_REPRO_LOG_END
+      fi
+      if [ -f /tmp/vit-repro-metrics.jsonl ]; then
+        cp /tmp/vit-repro-metrics.jsonl "$root/rank-0/benchmark/metrics.jsonl"
+      fi
+      status="$(cat /tmp/vit-repro-status 2>/dev/null || printf 1)"
+      exit "$status"
