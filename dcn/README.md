@@ -40,6 +40,32 @@ The two transport cases and all-gather report transmitted bytes. All-reduce
 reports input bytes times the ring-equivalent factor `2*(DP-1)/DP`; that factor
 is exactly one for DP2.
 
+### Instrumented timing and XLA flag A/B/A
+
+`timing_benchmark.py` preserves the original benchmark and replaces only its
+timing function. It emits JSON records from every rank with:
+
+- one separately measured first call, including compilation and execution;
+- a compiled warmup phase;
+- dispatch, device-wait, collective-only, and trailing-barrier times;
+- per-repetition `eth1` and `eth2` byte deltas.
+
+The A/B/A runner also emits a `DCN_HLO_SUMMARY` after each block so that
+collective-related tokens in optimized HLO can be compared across flags.
+
+Use the paired critical-path analyzer instead of averaging rank-local medians.
+For each repetition it takes the slower rank's collective-only time, excluding
+the trailing host barrier:
+
+```bash
+python3 dcn/timing_results.py /tmp/rank-0.log /tmp/rank-1.log
+python3 dcn/timing_results.py --json /tmp/rank-0.log /tmp/rank-1.log
+```
+
+The analyzer defaults to the dim-16384 all-reduce payload used here: 17.179869184
+Gbit per host and a 400 Gbps aggregate link. Override
+`--payload-gbits-per-host` and `--link-gbps` for a different workload.
+
 ## Falcon run
 
 Requirements: authenticated `falcon`, `jq`, two available reservation-backed
@@ -132,6 +158,12 @@ included or required.
 
 ### 3A. JobSet on dynamic `2x2x1` sub-slices
 
+This manifest targets a Kueue TAS dynamic-slicing cluster. The Pod annotation
+requests `2x2x1`; do not add a fixed `cloud.google.com/gke-tpu-topology`
+selector or a JobSet `exclusive-topology` annotation. Kueue admission owns the
+partition selection and injects the required topology affinity. The template
+uses `hostNetwork: true`, exposes `eth1` and `eth2`, and makes no DRA claim.
+
 ```bash
 ./dcn/k8s/render.sh jobset-dynamic "$IMAGE" /tmp/dcn-jobset.yaml
 kubectl apply -f /tmp/dcn-jobset.yaml
@@ -139,6 +171,39 @@ kubectl get jobset,pods -w
 kubectl wait --for=condition=Completed jobset/dcn-google-baseline --timeout=2h
 ./dcn/k8s/collect.sh jobset /tmp/dcn-metrics.jsonl
 ```
+
+To reproduce the XLA-requested measurement protocol (isolated first call,
+10,000 compiled warmups, then 20 paired batch-10 samples), render the dedicated
+instrumented template:
+
+```bash
+./dcn/k8s/render.sh jobset-dynamic-hostnetwork-10k "$IMAGE" \
+  /tmp/dcn-dynamic-hostnetwork-10k.yaml
+kubectl apply -f /tmp/dcn-dynamic-hostnetwork-10k.yaml
+kubectl wait --for=condition=Completed \
+  jobset/dcn-dyn-hn-10k --timeout=2h
+kubectl logs -l app=dcn-dyn-hn-10k \
+  --all-containers=true --prefix=true --tail=-1 > /tmp/dcn-dynamic-10k.log
+python3 dcn/timing_results.py /tmp/dcn-dynamic-10k.log
+```
+
+The Kueue local queue is named `default` in the supplied template. Change the
+`kueue.x-k8s.io/queue-name` label if the target cluster uses a different queue.
+
+Google also recommends increasing the TCP receive-buffer maximum. The supplied
+TPU7x adaptation preserves the upstream value and logs the old and new values:
+
+```bash
+kubectl apply -f dcn/k8s/tpu7x-increase-rmem.yaml
+kubectl rollout status daemonset/tcp-increase-rmem -n kube-system
+kubectl logs -n kube-system -l k8s-app=tcp-increase-rmem \
+  -c tcp-increase-rmem --prefix=true
+```
+
+The source is GoogleCloudPlatform/ai-on-gke
+`scripts/network-setup/v6e-increase-rmem.yaml` at commit
+`51bf3dcab6ff658cf62cc32867f96860bf58dfdc`; only the accelerator selector was
+changed from TPU-v6e to TPU7x, with before/after logging added.
 
 ### 3B. JobSet on pre-created static `2x2x1` node pools
 
@@ -150,8 +215,10 @@ kubectl wait --for=condition=Completed jobset/dcn-google-baseline --timeout=2h
 ./dcn/k8s/collect.sh jobset /tmp/dcn-metrics.jsonl
 ```
 
-The JobSet exclusive-topology annotation must assign its two replicated Jobs
-to different TPU slices. Verify the selected nodes before trusting a result:
+For the static template, the JobSet exclusive-topology annotation must assign
+its two replicated Jobs to different node pools. For the dynamic template,
+Kueue TAS must assign distinct slice/partition IDs. Verify the selected nodes
+before trusting a result:
 
 ```bash
 kubectl get pods -l jobset.sigs.k8s.io/jobset-name=dcn-google-baseline \
@@ -162,7 +229,39 @@ The manifests declare slice 0 / pod 0 as the JobSet coordinator and consume
 the controller-injected `jobset.sigs.k8s.io/coordinator` stable DNS label; no
 Pod IP or generated Pod name is hard-coded.
 
-### 3C. Two explicit Pods
+### 3C. Host-network A/B/A for one libtpu flag
+
+This mode targets two pre-created node pools that each expose `eth1` and `eth2`
+through additional node networks. The Pods use `hostNetwork: true` and do not
+request a DRA network resource. It runs baseline / candidate / baseline in
+three fresh libtpu processes, with 10,000 warmups per block:
+
+```bash
+./dcn/k8s/render.sh jobset-hostnetwork-flag-aba "$IMAGE" \
+  TPU_NODEPOOL_0 TPU_NODEPOOL_1 \
+  sparse_core_collective_aggregator \
+  '--xla_tpu_enable_sparse_core_collective_aggregator=true' \
+  /tmp/dcn-xla-flag-aba.yaml
+kubectl apply -f /tmp/dcn-xla-flag-aba.yaml
+kubectl wait --for=condition=Completed jobset/dcn-xla-flag-aba --timeout=2h
+kubectl logs -l jobset.sigs.k8s.io/jobset-name=dcn-xla-flag-aba \
+  --all-containers=true --prefix=true --tail=-1 > /tmp/dcn-xla-flag-aba.log
+python3 dcn/timing_results.py /tmp/dcn-xla-flag-aba.log
+```
+
+Test only one flag per rendered JobSet. Delete or rename the completed JobSet
+before rendering the next candidate. The same template can test the DCN
+all-reduce combiner threshold by changing the experiment and flag arguments:
+
+```bash
+./dcn/k8s/render.sh jobset-hostnetwork-flag-aba "$IMAGE" \
+  TPU_NODEPOOL_0 TPU_NODEPOOL_1 \
+  dcn_all_reduce_combiner_1g \
+  '--xla_tpu_dcn_all_reduce_combiner_threshold_bytes=1073741824' \
+  /tmp/dcn-combiner-flag-aba.yaml
+```
+
+### 3D. Two explicit Pods
 
 Use this when Google gives you the names of two distinct static TPU node pools:
 
